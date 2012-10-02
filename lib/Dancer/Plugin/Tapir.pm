@@ -66,7 +66,7 @@ use Tapir::MethodCall;
 
 my $json_xs = JSON::XS->new->allow_nonref->allow_blessed;
 
-our $VERSION = 0.02;
+our $VERSION = 0.03;
 
 register setup_thrift_handler => sub {
 	my ($self, @args) = plugin_args(@_);
@@ -157,11 +157,30 @@ register setup_thrift_handler => sub {
 			my $request = request;
 			my $params = $request->params;
 
+			# Decode the JSON payload
+			if ($request->content_length && $request->content_type && $request->content_type eq 'application/json' && length $request->body) {
+				my $body = try {
+					$json_xs->decode($request->body)
+				}
+				catch {
+					print STDERR "JSON payload was:\n" . $request->body . "\n";
+					die "Error in decoding the JSON payload (length " . $request->content_length . "): $_";
+				};
+				die unless $body && ref $body && ref $body eq 'HASH';
+				$params->{$_} = $body->{$_} foreach keys %$body;
+			}
+
 			my $thrift_message;
 			try {
 				$thrift_message = $method_message_class->compose_message_call(%$params);
 			}
 			catch {
+				my $ex = $_;
+				if (ref $ex && blessed $ex && $ex->isa('Exception::Class::Base')) {
+					if ($ex->isa('Thrift::Parser::InvalidArgument')) {
+						$ex->rethrow();
+					}
+				}
 				die "Error in composing $method_message_class message: $_\n";
 			};
 
@@ -213,11 +232,10 @@ register setup_thrift_handler => sub {
 
 			# The handler can communicate with us via 'rest_result' in the heap.  If set, use this to send
 			# extra headers or override our default status code
-			my $status_code_set;
+			my $status;
 			if (my $extra_actions = $call->heap_index('rest_result')) {
 				if (my $code = $extra_actions->{status_code}) {
-					status $code;
-					$status_code_set = $code;
+					$status = $code;
 				}
 				if (my $headers = $extra_actions->{headers}) {
 					headers %$headers;
@@ -228,8 +246,8 @@ register setup_thrift_handler => sub {
 
 			# The handler set result.  Validate the result value against the Thrift specification, and return
 			# it encoded in JSON.
+			my $response;
 			if ($result_key eq 'result') {
-				my $response;
 				try {
 					# Compose a reply to the method using the result value.  This will throw if any values are 
 					# missing or not valid for the specification.  This returns a Thrift::Parser::Message which
@@ -241,14 +259,17 @@ register setup_thrift_handler => sub {
 				catch {
 					die "Error in composing $method_message_class result: $_\n";
 				};
-				header 'content-type' => 'application/json';
-				return $response;
+				$status ||= 200;
+			}
+			# The handler set either 'error' or 'exception'; return a status 500 with a JSON payload describing the problem
+			else {
+				$status ||= 500;
+				$response = $json_xs->encode({ $result_key => $result_value });
 			}
 
-			# The handler set either 'error' or 'exception'; return a status 500 with a JSON payload describing the problem
 			header 'content-type' => 'application/json';
-			status 500 unless $status_code_set;
-			return $json_xs->encode({ $result_key => $result_value });
+			status $status;
+			return $response;
 		};
 
 		my $wrapper_sub = sub {
@@ -258,19 +279,35 @@ register setup_thrift_handler => sub {
 			}
 			catch {
 				my $ex = $_;
-				if (ref $ex && blessed $ex && $ex->isa('Thrift::Parser::Exception')) {
-					# Look for a stack trace frame that is not Thrift::Parser so we can see
-					# any thrift-related errors from the perspective of the caller
-					my ($trace_frame, $first_frame);
-					while (my $frame = $ex->trace->next_frame) {
-						$first_frame ||= $frame;
-						next if $frame->package =~ m{^Thrift};
-						$trace_frame = $frame;
-						last;
+				my $status = 'error';
+				if (ref $ex && blessed $ex && $ex->isa('Exception::Class::Base')) {
+					my $string_error;
+					if ($ex->isa('Tapir::InvalidArgument') || $ex->isa('Thrift::Parser::InvalidArgument')) {
+						$status = 400;
+						if ($ex->key && $ex->value) {
+							$string_error = sprintf "The argument '%s' ('%s') was invalid: %s", $ex->key, $ex->value, $ex->error;
+						}
+						elsif ($ex->key) {
+							$string_error = sprintf "The argument '%s' was invalid: %s", $ex->key, $ex->error;
+						}
+						else {
+							$string_error = sprintf "There was an invalid argument: %s", $ex->error;
+						}
 					}
-					$trace_frame ||= $first_frame;
+					else {
+						# Look for a stack trace frame that is not Thrift::Parser so we can see
+						# any thrift-related errors from the perspective of the caller
+						my ($trace_frame, $first_frame);
+						while (my $frame = $ex->trace->next_frame) {
+							$first_frame ||= $frame;
+							next if $frame->package =~ m{^Thrift};
+							$trace_frame = $frame;
+							last;
+						}
+						$trace_frame ||= $first_frame;
 
-					my $string_error = $ex->error . " in " . $trace_frame->as_string;
+						$string_error = $ex->error . " in " . $trace_frame->as_string;
+					}
 					$logger->error($string_error);
 					$result = $json_xs->encode({
 						error => $string_error,
@@ -278,10 +315,10 @@ register setup_thrift_handler => sub {
 				}
 				else {
 					$logger->error("$ex");
-					$result = $json_xs->encode({ exception => $ex });
+					$result = $json_xs->encode({ exception => "$ex" });
 				}
 				header 'content-type' => 'application/json';
-				status 'error';
+				status $status;
 			};
 
 			# Returning the result will print it to the HTTP response
