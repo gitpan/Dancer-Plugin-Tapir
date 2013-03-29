@@ -7,6 +7,7 @@ use Try::Tiny;
 use Capture::Tiny qw(capture);
 use JSON::XS qw();
 use Scalar::Util qw(blessed);
+use File::Spec;
 
 # POE sessions will be created by Tapir::MethodCall; let's not see an error about POE never running
 use POE;
@@ -17,11 +18,10 @@ use Thrift::Parser;
 use Tapir::Validator;
 use Tapir::MethodCall;
 use Tapir::Documentation::NaturalDocs;
-use File::Spec;
 
 my $json_xs = JSON::XS->new->allow_nonref->allow_blessed;
 
-our $VERSION = 0.04;
+our $VERSION = 0.05;
 
 register setup_tapir_documentation => sub {
     my ($self, @args) = plugin_args(@_);
@@ -35,7 +35,7 @@ register setup_tapir_documentation => sub {
         croak "Missing configuration settings for setup_tapir_docs: " . join('; ', @missing_args);
     }
     if (! $conf{naturaldocs_bin}) {
-        $conf{naturaldocs_bin} = `which NaturalDocs`;
+        $conf{naturaldocs_bin} = which('NaturalDocs');
         chomp $conf{naturaldocs_bin};
         if (! $conf{naturaldocs_bin}) {
             croak "You must pass 'naturaldocs_bin' to indicate where the binary NaturalDocs is";
@@ -165,6 +165,19 @@ register setup_tapir_handler => sub {
                 };
                 die unless $body && ref $body && ref $body eq 'HASH';
                 $params->{$_} = $body->{$_} foreach keys %$body;
+            }
+            else {
+                # Allow the user to pass "?$json_string" in query string
+                my @params = $request->params('query');
+                if (int @params == 2 && $params[1] eq '') {
+                    my $query_json = try {
+                        $json_xs->decode($params[0]);
+                    };
+                    if ($query_json) {
+                        delete $params->{ $params[0] };
+                        $params->{$_} = $query_json->{$_} foreach keys %$query_json;
+                    }
+                }
             }
 
             my $thrift_message;
@@ -332,6 +345,15 @@ register setup_tapir_handler => sub {
 
 register_plugin;
 
+sub which {
+    my ($bin) = @_;
+    foreach my $path (split /:/, $ENV{PATH}) {
+        my $possible_path = File::Spec->catfile($path, $bin);
+        return $possible_path if -x $possible_path;
+    }
+    return;
+}
+
 {
     package Dancer::LoggerMockObject;
 
@@ -398,6 +420,10 @@ Add something like this to your YAML config:
 =head1 SEE ALSO
 
 L<Tapir>, L<Dancer>
+
+=head1 LICENSE
+
+This library is free software; you may redistribute it and/or modify it under the same terms as Perl itself
 
 =head1 COPYRIGHT
 
